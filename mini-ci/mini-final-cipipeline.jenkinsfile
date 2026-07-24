@@ -1,0 +1,288 @@
+/**
+ * mini-final-cipipeline.jenkinsfile
+ * 
+ * MAPS TO: CI/final-cipipeline.jenkinsfile in CustomerXP
+ * 
+ * This is the MAIN ENTRY POINT. It orchestrates the entire CI pipeline:
+ *   1. Register parameters (Build with Parameters UI)
+ *   2. Validate configuration (check Jenkins global env vars)
+ *   3. Initialize & Clean workspace
+ *   4. Sequential chain build (core modules in dependency order)
+ *   5. Parallel build (installer modules simultaneously)
+ *   6. Publish consolidated report
+ *
+ * ARCHITECTURE COMPARISON:
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │  CustomerXP (Production)          │  Mini CI (This file)                │
+ * ├───────────────────────────────────┼─────────────────────────────────────┤
+ * │  @Library('customerxp-...')       │  @Library('mini-ci-lib')            │
+ * │  GitLab private repos             │  GitHub public repos                │
+ * │  Active Choices (GitLab API)      │  Simple choice parameters           │
+ * │  Maven + Nexus                    │  Detect & validate build            │
+ * │  SonarQube + DefectDojo           │  Simulated security scan            │
+ * │  30+ env vars required            │  5 env vars required                │
+ * │  Multiple JDK versions            │  Single agent                       │
+ * │  publishSonarReport()             │  publishReport() with HTML          │
+ * └───────────────────────────────────┴─────────────────────────────────────┘
+ *
+ * PUBLIC REPOS USED (simulating CustomerXP modules):
+ *   Core (sequential):
+ *     - 2048         → simulates "commons" (base dependency, must build first)
+ *     - markdown-here → simulates "core-lib" (depends on commons)
+ *   
+ *   Installers (parallel):
+ *     - html5-boilerplate → simulates "cmq" module
+ *     - you-dont-need-js  → simulates "efmapp" module
+ *     - air-quality       → simulates "inbox" module
+ */
+
+@Library('mini-ci-lib') _
+
+pipeline {
+    agent any
+
+    environment {
+        BUILD_TYPE = 'snapshot'
+    }
+
+    parameters {
+        // MAPS TO: CascadeChoiceParameter CORE_SELECTED in CustomerXP
+        // CustomerXP uses Active Choices plugin to fetch module list from CX_CORE_MODULE_IDS
+        // We use a simple checkbox since we don't need GitLab API
+        choice(name: 'CORE_MODULES', 
+               choices: ['all', '2048', 'markdown-here', 'none'], 
+               description: 'Core modules to build sequentially (maps to CORE_SELECTED in CustomerXP)')
+
+        // MAPS TO: CascadeChoiceParameter INST_SELECTED in CustomerXP
+        choice(name: 'INSTALLER_MODULES', 
+               choices: ['all', 'html5-boilerplate', 'you-dont-need-js', 'none'], 
+               description: 'Installer modules to build in parallel (maps to INST_SELECTED in CustomerXP)')
+
+        // MAPS TO: ExtendedChoiceParameter jdk_version in CustomerXP
+        // CustomerXP offers JDK 8, 11, 17 checkboxes
+        choice(name: 'BUILD_SPEED', 
+               choices: ['normal', 'fast', 'verbose'], 
+               description: 'Build mode (maps to jdk_version selection in CustomerXP)')
+    }
+
+    stages {
+        /**
+         * STAGE 1: Register Job Parameters
+         * MAPS TO: stage('Register job parameters') in CustomerXP
+         * 
+         * CustomerXP calls registerCxCiJobParameters() which uses:
+         * - CascadeChoiceParameter for module checkboxes
+         * - DynamicReferenceParameter for branch dropdowns (calls GitLab API!)
+         * - ExtendedChoiceParameterDefinition for JDK checkboxes
+         * 
+         * Our version: Parameters are defined declaratively above.
+         * First build registers them, subsequent builds show "Build with Parameters".
+         */
+        stage('Register job parameters') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════'
+                    echo '  Stage 1: REGISTER JOB PARAMETERS'
+                    echo '═══════════════════════════════════════════════════'
+                    echo "✅ Parameters registered (refresh page if first run)"
+                    echo "   CORE_MODULES: ${params.CORE_MODULES}"
+                    echo "   INSTALLER_MODULES: ${params.INSTALLER_MODULES}"
+                    echo "   BUILD_SPEED: ${params.BUILD_SPEED}"
+                    echo ""
+                    echo "📝 CustomerXP equivalent:"
+                    echo "   CORE_SELECTED → dynamic checkboxes from CX_CORE_MODULE_IDS"
+                    echo "   INST_SELECTED → dynamic checkboxes from CX_INSTALLER_MODULE_IDS"  
+                    echo "   CORE_BRANCH_CHOICES → GitLab API branch dropdown per module"
+                    echo "   jdk_version → JDK checkboxes from CX_JDK_VERSION_OPTIONS"
+                }
+            }
+        }
+
+        /**
+         * STAGE 2: Validate Global Configuration
+         * MAPS TO: stage('Validate global configuration') in CustomerXP
+         *
+         * CustomerXP calls cxPipelineConfig() which validates 15+ env vars:
+         * JENKINS_GIT_ORG, CX_GIT_HOST, JENKINS_NEXUS_URL, etc.
+         * Fails immediately with a clear error listing all missing vars.
+         *
+         * Our version: miniPipelineConfig() checks 5 required vars.
+         */
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════'
+                    echo '  Stage 2: VALIDATE GLOBAL CONFIGURATION'
+                    echo '═══════════════════════════════════════════════════'
+
+                    def config = miniPipelineConfig()
+
+                    // Store config for later stages (like CustomerXP's CX_PIPELINE_CFG_JSON)
+                    env.PIPELINE_CONFIG_VALIDATED = 'true'
+                }
+            }
+        }
+
+        /**
+         * STAGE 3: Initialize & Clean
+         * MAPS TO: stage('Initialize & Clean') in CustomerXP
+         *
+         * CustomerXP:
+         * - Deletes EFFECTIVE_GIT_LOCAL_MIRROR_BASE/EFFECTIVE_GIT_ORG_DIR (old git mirrors)
+         * - Runs cleanWs() to wipe Jenkins workspace
+         *
+         * Our version: Same cleanWs() call.
+         */
+        stage('Initialize & Clean') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════'
+                    echo '  Stage 3: INITIALIZE & CLEAN'
+                    echo '═══════════════════════════════════════════════════'
+                    echo "Cleaning workspace: ${env.WORKSPACE}"
+                }
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+                script {
+                    echo "✅ Workspace cleaned"
+                }
+            }
+        }
+
+        /**
+         * STAGE 4: Process Selection & Execution
+         * MAPS TO: stage('Process Selection & Execution') in CustomerXP
+         *
+         * This is the MAIN LOGIC. CustomerXP does:
+         * 1. Parse module→branch maps from CORE_BRANCH_CHOICES, INST_BRANCH_CHOICES
+         * 2. Split installer modules into: sequential (cc) + parallel (rest)
+         * 3. Order sequential modules by CX_CHAIN_ORDER
+         * 4. Execute chain build for sequential modules
+         * 5. Execute parallel build for remaining installer modules
+         * 6. Publish Sonar report for all modules
+         *
+         * Our version: Same 3-phase execution flow.
+         */
+        stage('Process Selection & Execution') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════'
+                    echo '  Stage 4: PROCESS SELECTION & EXECUTION'
+                    echo '═══════════════════════════════════════════════════'
+
+                    // --- Parse config (like CustomerXP re-reads cfg) ---
+                    def config = miniPipelineConfig()
+
+                    // --- Resolve selected modules (like CustomerXP's parseModuleBranchMap) ---
+                    def selectedCore = []
+                    def selectedInstallers = []
+
+                    if (params.CORE_MODULES == 'all') {
+                        selectedCore = config.coreModuleIds.clone()
+                    } else if (params.CORE_MODULES != 'none') {
+                        selectedCore = [params.CORE_MODULES]
+                    }
+
+                    if (params.INSTALLER_MODULES == 'all') {
+                        selectedInstallers = config.installerModuleIds.clone()
+                    } else if (params.INSTALLER_MODULES != 'none') {
+                        selectedInstallers = [params.INSTALLER_MODULES]
+                    }
+
+                    // --- Branch map (CustomerXP gets from CORE_BRANCH_CHOICES/INST_BRANCH_CHOICES) ---
+                    // We default everything to 'master' or 'main'
+                    def branchMap = [:]
+                    selectedCore.each { branchMap[it] = 'master' }
+                    selectedInstallers.each { branchMap[it] = 'master' }
+                    // Special cases
+                    branchMap['markdown-here'] = 'master'
+                    branchMap['2048'] = 'master'
+                    branchMap['html5-boilerplate'] = 'main'
+                    branchMap['you-dont-need-js'] = 'master'
+
+                    echo ""
+                    echo "📋 Build Plan:"
+                    echo "   Sequential (chain): ${selectedCore.join(', ') ?: '(none)'}"
+                    echo "   Parallel:           ${selectedInstallers.join(', ') ?: '(none)'}"
+                    echo ""
+
+                    // ╔══════════════════════════════════════════════════════╗
+                    // ║  PHASE A: SEQUENTIAL CHAIN BUILD                    ║
+                    // ║  Maps to: CustomerXP sequential lane                ║
+                    // ║  (core modules + cc in CX_CHAIN_ORDER sequence)     ║
+                    // ╚══════════════════════════════════════════════════════╝
+                    if (selectedCore) {
+                        executeChainBuild(
+                            modules: selectedCore,
+                            branchMap: branchMap,
+                            config: config,
+                            buildType: env.BUILD_TYPE
+                        )
+                    } else {
+                        echo "⏭️ No core modules selected. Skipping sequential chain build."
+                    }
+
+                    // ╔══════════════════════════════════════════════════════╗
+                    // ║  PHASE B: PARALLEL BUILD                            ║
+                    // ║  Maps to: CustomerXP parallel installer lane        ║
+                    // ║  (all non-sequential installer modules at once)     ║
+                    // ╚══════════════════════════════════════════════════════╝
+                    if (selectedInstallers) {
+                        executeParallelBuild(
+                            modules: selectedInstallers,
+                            branchMap: branchMap,
+                            config: config,
+                            buildType: env.BUILD_TYPE
+                        )
+                    } else {
+                        echo "⏭️ No installer modules selected. Skipping parallel build."
+                    }
+
+                    // ╔══════════════════════════════════════════════════════╗
+                    // ║  PHASE C: PUBLISH REPORT                            ║
+                    // ║  Maps to: publishSonarReport() in CustomerXP        ║
+                    // ║  (consolidated quality metrics for all modules)     ║
+                    // ╚══════════════════════════════════════════════════════╝
+                    def allModulesForReport = []
+                    selectedCore.each { modName ->
+                        allModulesForReport << [moduleName: modName, branchName: branchMap[modName] ?: 'main']
+                    }
+                    selectedInstallers.each { modName ->
+                        allModulesForReport << [moduleName: modName, branchName: branchMap[modName] ?: 'main']
+                    }
+
+                    if (allModulesForReport) {
+                        publishReport(
+                            modules: allModulesForReport,
+                            reportName: 'Mini CI Report',
+                            buildType: env.BUILD_TYPE
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * POST ACTIONS
+     * MAPS TO: post { always { } } in CustomerXP
+     * CustomerXP logs the final job result.
+     */
+    post {
+        always {
+            script {
+                echo ""
+                echo "═══════════════════════════════════════════════════"
+                echo "  PIPELINE COMPLETE"
+                echo "  Result: ${currentBuild.result ?: 'SUCCESS'}"
+                echo "  Duration: ${currentBuild.durationString}"
+                echo "═══════════════════════════════════════════════════"
+            }
+        }
+        success {
+            echo "🎉 All modules built and scanned successfully!"
+        }
+        failure {
+            echo "❌ Pipeline failed — check stage logs above for details"
+        }
+    }
+}
