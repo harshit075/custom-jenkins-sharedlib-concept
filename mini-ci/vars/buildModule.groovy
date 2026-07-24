@@ -187,7 +187,7 @@ def resolveRepoUrl(String moduleName, Map config) {
         '2048'                : 'https://github.com/gabrielecirulli/2048.git',
         'markdown-here'       : 'https://github.com/adam-p/markdown-here.git',
         'html5-boilerplate'   : 'https://github.com/h5bp/html5-boilerplate.git',
-        'you-dont-need-js'    : 'https://github.com/nicehash/you-dont-need-javascript.git',
+        'you-dont-need-js'    : 'https://github.com/you-dont-need/You-Dont-Need-JavaScript.git',
     ]
 
     def url = repoMap[moduleName]
