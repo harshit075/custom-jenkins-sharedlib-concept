@@ -41,7 +41,6 @@ def call(Map args) {
 
     modules.each { moduleName ->
         def branch = branchMap[moduleName] ?: 'main'
-        def repoUrl = "${config.gitBaseUrl}/${config.gitOrg}/${moduleName}.git"
 
         // Each entry in parallelTasks becomes a concurrent branch
         parallelTasks["build-${moduleName}"] = {
@@ -49,13 +48,11 @@ def call(Map args) {
             echo "┌─────────────────────────────────────────────────"
             echo "│ 🚀 PARALLEL BUILD: ${moduleName}"
             echo "│ Branch: ${branch}"
-            echo "│ Repo: ${repoUrl}"
             echo "└─────────────────────────────────────────────────"
 
             buildModule(
                 moduleName: moduleName,
                 branch: branch,
-                repoUrl: repoUrl,
                 config: config,
                 buildType: buildType,
                 isChainBuild: false

@@ -55,20 +55,18 @@ def call(Map args) {
     // Build each module sequentially (one after another)
     orderedModules.each { moduleName ->
         def branch = branchMap[moduleName] ?: 'main'
-        def repoUrl = "${config.gitBaseUrl}/${config.gitOrg}/${moduleName}.git"
 
         echo ""
         echo "┌─────────────────────────────────────────────────"
         echo "│ 🏗️  CHAIN BUILD: ${moduleName}"
         echo "│ Branch: ${branch}"
-        echo "│ Repo: ${repoUrl}"
         echo "└─────────────────────────────────────────────────"
 
         // Call the actual build function (like CustomerXP's buildModulesWithJDK)
+        // repoUrl resolved inside buildModule via resolveRepoUrl() — like moduleSpecialCases.groovy
         buildModule(
             moduleName: moduleName,
             branch: branch,
-            repoUrl: repoUrl,
             config: config,
             buildType: buildType,
             isChainBuild: true

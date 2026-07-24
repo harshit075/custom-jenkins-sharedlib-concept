@@ -193,11 +193,20 @@ pipeline {
                     def branchMap = [:]
                     selectedCore.each { branchMap[it] = 'master' }
                     selectedInstallers.each { branchMap[it] = 'master' }
-                    // Special cases
+                    // Special cases — different repos use different default branches
                     branchMap['markdown-here'] = 'master'
                     branchMap['2048'] = 'master'
                     branchMap['html5-boilerplate'] = 'main'
                     branchMap['you-dont-need-js'] = 'master'
+                    
+                    // Repo URL map (different modules live in different GitHub orgs)
+                    // MAPS TO: CI/vars/moduleSpecialCases.groovy in CustomerXP
+                    def repoUrlMap = [
+                        '2048'              : 'https://github.com/gabrielecirulli/2048.git',
+                        'markdown-here'     : 'https://github.com/adam-p/markdown-here.git',
+                        'html5-boilerplate' : 'https://github.com/h5bp/html5-boilerplate.git',
+                        'you-dont-need-js'  : 'https://github.com/nicehash/you-dont-need-javascript.git',
+                    ]
 
                     echo ""
                     echo "📋 Build Plan:"

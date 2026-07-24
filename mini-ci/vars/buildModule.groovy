@@ -26,7 +26,7 @@
 def call(Map args) {
     def moduleName = args.moduleName
     def branch = args.branch ?: 'main'
-    def repoUrl = args.repoUrl
+    def repoUrl = args.repoUrl ?: resolveRepoUrl(moduleName, args.config)
     def config = args.config ?: [:]
     def buildType = args.buildType ?: 'snapshot'
     def isChainBuild = args.isChainBuild ?: false
@@ -172,6 +172,31 @@ def executeBuild(String projectType, String moduleName) {
  * CustomerXP runs: SonarQube, CycloneDX SBOM, Gitleaks, JaCoCo, Dependency-Track, DefectDojo.
  * We simulate the output to show what each tool does.
  */
+/**
+ * Resolve the actual GitHub repo URL for a module.
+ * In CustomerXP, all repos are in the same GitLab org.
+ * For public GitHub, different repos belong to different users.
+ * This maps module names to their actual repo URLs.
+ * 
+ * MAPS TO: CI/vars/moduleSpecialCases.groovy in CustomerXP
+ * (handles modules that live in different GitLab namespaces)
+ */
+def resolveRepoUrl(String moduleName, Map config) {
+    // Module → actual GitHub repo mapping
+    def repoMap = [
+        '2048'                : 'https://github.com/gabrielecirulli/2048.git',
+        'markdown-here'       : 'https://github.com/adam-p/markdown-here.git',
+        'html5-boilerplate'   : 'https://github.com/h5bp/html5-boilerplate.git',
+        'you-dont-need-js'    : 'https://github.com/nicehash/you-dont-need-javascript.git',
+    ]
+
+    def url = repoMap[moduleName]
+    if (url) return url
+
+    // Fallback: use MINI_GIT_BASE_URL/MINI_GIT_ORG/moduleName.git
+    return "${config.gitBaseUrl ?: 'https://github.com'}/${config.gitOrg ?: 'gabrielecirulli'}/${moduleName}.git"
+}
+
 def runSecurityScan(String moduleName, String projectType) {
     echo "   ┌─ Security Scan Results for ${moduleName} ─────────"
 
