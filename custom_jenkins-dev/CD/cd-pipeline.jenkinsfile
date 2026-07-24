@@ -1,0 +1,136 @@
+// CD Pipeline – Continuous Deployment for CustomerXP modules
+// Active Choice / Dynamic parameters: registered from the first stage (same pattern as final-cipipeline.jenkinsfile)
+// so Jenkins reliably attaches "Build with Parameters" (top-level properties() before pipeline {} is ignored on some controllers).
+@Library('customerxp-jenkins-shared-library@develop') _
+
+/**
+ * Global properties (Manage Jenkins → Environment variables) are often not on the controller process — System.getenv is empty.
+ * Active Choices Groovy runs on the controller; read globals via Jenkins.getInstance() when needed in shared code.
+ * During a Pipeline script step, {@code env} includes those globals — use {@link #resolveEnvWithPipeline} for steps that need both.
+ *
+ * P2-1: Resolution is implemented once in {@code vars-cd/resolveCdEnv.groovy}; this wrapper keeps existing call sites unchanged.
+ * P2-2: Large Active Choice SecureGroovyScript bodies live in {@code src/org/customerxp/cd/CdJobParameterScripts.groovy}.
+ *
+ * Phase 1 env inventory (canonical vs legacy names): {@code CD-pipeline/config/cdGlobalEnvInventory.groovy}
+ */
+String resolveEnvWithPipeline(String name, Object pipelineEnv = null) {
+    resolveCdEnv(name, pipelineEnv)
+}
+
+/**
+ * P2-1: Build-with-Parameters definitions live in {@code vars-cd/cdPipelineParameters.groovy} ({@code cdPipelineParameters(env: env)}).
+ */
+
+pipeline {
+    agent any
+
+    environment {
+        // Keep minimal literals; prefer Manage Jenkins global properties (see vars/cxPipelineConfig.groovy header + getCDDefaults / future cdPipelineConfig).
+        CI = 'false'
+    }
+
+    stages {
+        stage('Verify CD environment') {
+            steps {
+                script {
+                    verifyCdPipelineEnv(checkServersFile: true, checkDbConfigFile: false)
+                }
+            }
+        }
+
+        stage('Register job parameters') {
+            steps {
+                script {
+                    try {
+                        cdPipelineParameters(env: env)
+                        echo '✅ CD job parameter definitions applied (refresh the job page once; next runs use Build with Parameters).'
+                        echo "   CX_JDK_VERSION_OPTIONS resolved for JDK_VERSION: ${resolveEnvWithPipeline('CX_JDK_VERSION_OPTIONS', env) ?: '(empty — fallback jdk-17,jdk-11,jdk-8)'}"
+                    } catch (Throwable t) {
+                        echo "❌ cdPipelineParameters failed: ${t.class.name}: ${t.message}"
+                        throw t
+                    }
+                }
+            }
+        }
+
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    def wsPath = resolveEnvWithPipeline('JENKINS_CD_WORKSPACE', env)?.trim()
+                    if (!wsPath) {
+                        error 'Validate global configuration: set JENKINS_CD_WORKSPACE (absolute path on the Jenkins agent for CD workspace files).'
+                    }
+                    env.JENKINS_CD_WORKSPACE = wsPath
+
+                    def nexusBase = resolveEnvWithPipeline('JENKINS_NEXUS_URL', env)?.trim()
+                    if (!nexusBase) {
+                        error 'Validate global configuration: set JENKINS_NEXUS_URL (Nexus base URL).'
+                    }
+                    env.JENKINS_NEXUS_URL = nexusBase
+
+                    def nexusCredsId = resolveEnvWithPipeline('JENKINS_NEXUS_CREDENTIALS', env)?.trim()
+                    if (!nexusCredsId) {
+                        error 'Validate global configuration: set JENKINS_NEXUS_CREDENTIALS (Jenkins username/password credential id for Nexus .tgz pre-download).'
+                    }
+                    env.JENKINS_NEXUS_CREDENTIALS = nexusCredsId
+
+                    echo '✅ CD globals resolved for this run (override via Manage Jenkins env):'
+                    echo "   JENKINS_CD_WORKSPACE=${env.JENKINS_CD_WORKSPACE}"
+                    echo "   JENKINS_NEXUS_URL=${env.JENKINS_NEXUS_URL}"
+                    echo "   JENKINS_NEXUS_CREDENTIALS=${env.JENKINS_NEXUS_CREDENTIALS}"
+
+                    // P1-2 / P1-5: module registry + version/provenance in logs
+                    def modReg = loadModuleRegistry()
+                    def refFromJson = modReg.gitRef?.toString()?.trim()
+                    env.CX_CD_MODULE_REGISTRY_VERSION = modReg.version?.toString() ?: ''
+                    env.CX_CD_MODULE_REGISTRY_SOURCE = modReg._registryLoadSource?.toString() ?: ''
+                    env.CX_CD_MODULE_REGISTRY_REF = refFromJson ?: ''
+                    echo '✅ Module registry (validate)'
+                    echo "   documentVersion=${modReg.version} moduleCount=${modReg.modules?.size()} loadSource=${modReg._registryLoadSource}"
+                    echo "   gitRef=${env.CX_CD_MODULE_REGISTRY_REF ?: '(unset — set gitRef in module-registry.json)'}"
+                }
+            }
+        }
+
+        stage('Initialize & Clean') {
+            steps {
+                script {
+                    sh """
+                        rm -rf ${env.JENKINS_CD_WORKSPACE}
+                        mkdir -p ${env.JENKINS_CD_WORKSPACE}
+                    """
+                }
+            }
+        }
+
+        stage('Deploy Modules') {
+            steps {
+                ws("${env.JENKINS_CD_WORKSPACE}") {
+                    script {
+                        def nexusCredsId = env.JENKINS_NEXUS_CREDENTIALS?.toString()?.trim()
+                        if (!nexusCredsId) {
+                            error 'Deploy Modules: JENKINS_NEXUS_CREDENTIALS is required (set in Manage Jenkins global env; validated in Validate global configuration).'
+                        }
+                        withCredentials([usernamePassword(credentialsId: nexusCredsId, usernameVariable: 'NEXUS_PACKAGE_USER', passwordVariable: 'NEXUS_PACKAGE_PASSWORD')]) {
+                            script {
+                                echo "━━━ CD Deploy ━━━ registry=${env.CX_CD_MODULE_REGISTRY_VERSION ?: '?'} ref=${env.CX_CD_MODULE_REGISTRY_REF ?: '—'} source=${env.CX_CD_MODULE_REGISTRY_SOURCE ?: '—'} ━━━"
+                                executeDeployPipeline(
+                                    params: params,
+                                    env: env
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "CD Job Result: ${currentBuild.result ?: 'SUCCESS'}"
+            echo "CD module registry snapshot: version=${env.CX_CD_MODULE_REGISTRY_VERSION ?: '—'} gitRef=${env.CX_CD_MODULE_REGISTRY_REF ?: '—'} source=${env.CX_CD_MODULE_REGISTRY_SOURCE ?: '—'}"
+            echo 'Per-module deploy stages are listed under Deploy Modules (e.g. Deploy cmq, Deploy hes4j). Overall job fails if any module stage failed.'
+        }
+    }
+}

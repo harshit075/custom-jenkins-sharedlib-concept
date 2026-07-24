@@ -1,0 +1,162 @@
+{
+  "version": "1.0.0",
+  "gitRef": "",
+  "modules": [
+    {
+      "id": "cc",
+      "displayName": "CC / Platform",
+      "dbRole": "PRIMARY_DB",
+      "deployKind": "cc_setup",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "cc"
+    },
+    {
+      "id": "cmq",
+      "displayName": "CMQ",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "cmq"
+    },
+    {
+      "id": "efmapp",
+      "displayName": "EFM App",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "efmapp"
+    },
+    {
+      "id": "eoi",
+      "displayName": "EOI",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "eoi"
+    },
+    {
+      "id": "ext-api",
+      "displayName": "External API",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "ext-api"
+    },
+    {
+      "id": "hes4j",
+      "displayName": "HES4J",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "hes4j"
+    },
+    {
+      "id": "icms",
+      "displayName": "ICMS",
+      "dbRole": "CUSTOM_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "icms"
+    },
+    {
+      "id": "inbox",
+      "displayName": "Inbox",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "inbox"
+    },
+    {
+      "id": "inboxapp",
+      "displayName": "Inbox App",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "inboxapp"
+    },
+    {
+      "id": "rda",
+      "displayName": "RDA",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "rda"
+    },
+    {
+      "id": "tasd",
+      "displayName": "TASD",
+      "dbRole": "SHARED_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "tasd"
+    },
+    {
+      "id": "ucms",
+      "displayName": "UCMS",
+      "dbRole": "CUSTOM_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "ucms"
+    },
+    {
+      "id": "ncrp",
+      "displayName": "NCRP",
+      "dbRole": "CUSTOM_DB",
+      "deployKind": "module_deploy",
+      "scripts": {
+        "ccSetupUrl": null,
+        "moduleDeployUrl": null,
+        "moduleJsonUrl": null
+      },
+      "repoPath": "ncrp"
+    }
+  ]
+}

@@ -1,0 +1,777 @@
+// main Jenkinsfile
+import hudson.model.*
+import jenkins.model.Jenkins
+import hudson.slaves.EnvironmentVariablesNodeProperty
+
+// Use the name defined in your Global Shared Libraries config
+@Library('customerxp-jenkins-shared-library@develop') _
+
+/**
+ * Values from Manage Jenkins → Configure System → Global properties → Environment variables are injected
+ * into *builds* as env — they are often NOT on the controller process environment, so System.getenv('CX_*')
+ * here is empty. Active Choices Groovy also runs on the controller for parameter UI — read globals explicitly.
+ */
+String readGlobalOrSystemEnv(String name) {
+    def v = System.getenv(name)?.toString()?.trim()
+    if (v) return v
+    try {
+        def props = Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)
+        for (p in props) {
+            def ev = p.getEnvVars().get(name, '')?.toString()?.trim()
+            if (ev) return ev
+        }
+    } catch (Throwable ignored) { }
+    return ''
+}
+
+/**
+ * During a Pipeline {@code script { }} step, {@code env} includes Manage Jenkins → Global properties.
+ * Plain methods cannot see {@code env} unless passed — use this for JDK (Extended Choice) resolution.
+ * Active Choices Groovy still uses {@link #readGlobalOrSystemEnv} only (no build {@code env} there).
+ */
+String resolveEnvWithPipeline(String name, Object pipelineEnv = null) {
+    if (pipelineEnv != null) {
+        try {
+            def map = pipelineEnv.getEnvironment()
+            if (map != null) {
+                def v = map.get(name)
+                if (v != null && v.toString().trim()) {
+                    return v.toString().trim()
+                }
+            }
+        } catch (Throwable ignored) { }
+        try {
+            def v2 = pipelineEnv[name]
+            if (v2 != null && v2.toString().trim()) {
+                return v2.toString().trim()
+            }
+        } catch (Throwable ignored2) { }
+    }
+    return readGlobalOrSystemEnv(name)
+}
+
+// Active Choices / Extended Choice cannot live in Declarative `parameters { }`; they must use the `properties` step.
+// Define them in a function and call from the first stage so Jenkins reliably attaches parameters to this job
+// (top-level `properties()` before `pipeline {}` is skipped or ignored on some controllers → only "Build Now").
+//
+// CPS note: pass {@code env} from the stage so CX_JDK_* global properties are visible (see resolveEnvWithPipeline).
+def registerCxCiJobParameters(pipelineEnv = null) {
+    def jdkOptsStr = resolveEnvWithPipeline('CX_JDK_VERSION_OPTIONS', pipelineEnv)
+        .split(',')
+        .collect { it.trim() }
+        .findAll { it }
+        .join(',')
+    def jdkDefStr = resolveEnvWithPipeline('CX_JDK_VERSION_DEFAULT', pipelineEnv).trim()
+    def jdkChoiceValues = jdkOptsStr?.trim() ? jdkOptsStr
+    def jdkChoiceDefault = jdkDefStr?.trim() ? jdkDefStr : jdkChoiceValues.tokenize(',').first().trim()
+    properties([
+        parameters([
+        [$class: 'CascadeChoiceParameter',
+            name: 'CORE_SELECTED',
+            choiceType: 'PT_CHECKBOX',
+            description: 'Select Core modules (Prerequisites)',
+            script: [
+                $class: 'GroovyScript',
+                script: [
+                    $class: 'SecureGroovyScript',
+                    sandbox: false,
+                    script: """
+                        import jenkins.model.Jenkins
+                        import hudson.slaves.EnvironmentVariablesNodeProperty
+                        String envVar(String n) {
+                            def s = System.getenv(n)
+                            if (s) return s
+                            try {
+                                for (p in Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)) {
+                                    def v = p.getEnvVars().get(n, '')?.toString()?.trim()
+                                    if (v) return v
+                                }
+                            } catch (Throwable e) { }
+                            return ''
+                        }
+                        def coreModules = (envVar('CX_CORE_MODULE_IDS') ?: '')
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
+                        return coreModules
+                    """
+                ],
+                fallbackScript: [$class: 'SecureGroovyScript', sandbox: true, script: "return []"]
+            ]
+        ],
+        [$class: 'DynamicReferenceParameter',
+            name: 'CORE_BRANCH_CHOICES',
+            referencedParameters: 'CORE_SELECTED',
+            choiceType: 'ET_FORMATTED_HTML',
+            description: 'Assign branch per selected Core module',
+            script: [
+                $class: 'GroovyScript',
+                script: [
+                    $class: 'SecureGroovyScript',
+                    sandbox: false,
+                    // IMPORTANT: Replace 'gitlab-token' with the actual ID of your Jenkins Secret Text credential
+                    // containing the GitLab private token.
+                    script: """
+                        import groovy.json.JsonSlurper
+                        import java.net.URL
+                        import java.net.URLEncoder
+                        import jenkins.model.Jenkins
+                        import com.cloudbees.plugins.credentials.CredentialsProvider
+                        import org.jenkinsci.plugins.plaincredentials.StringCredentials
+                        import hudson.slaves.EnvironmentVariablesNodeProperty
+                        
+                        String envVar(String n) {
+                            def s = System.getenv(n)
+                            if (s) return s
+                            try {
+                                for (p in Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)) {
+                                    def v = p.getEnvVars().get(n, '')?.toString()?.trim()
+                                    if (v) return v
+                                }
+                            } catch (Throwable e) { }
+                            return ''
+                        }
+                        
+                            def gitlabUrl = (envVar('CX_GITLAB_API_URL') ?: '').trim()
+                            def gitOrg = (envVar('CX_GITLAB_ORG') ?: '').trim()
+                            def namespaces = (envVar('CX_GITLAB_NAMESPACES') ?: '')
+                                .split(',')
+                                .collect { it.trim() }
+                                .findAll { it }
+                            def credentialsId = (envVar('CX_GITLAB_TOKEN_CREDENTIAL_ID') ?: '').trim()
+                            
+                            def jenkins = Jenkins.get()
+                        
+                            def creds = CredentialsProvider.lookupCredentials(
+                                StringCredentials.class,
+                                jenkins,
+                                null,
+                                null
+                            ).find { it.id == credentialsId }
+                            
+                            if (!creds) {
+                            return "<b style='color:red'>GitLab credential not found</b>"
+                            }
+                            
+                            def privateToken = creds.secret.plainText
+                        
+                        if (!CORE_SELECTED) {
+                                return "<i>Select modules above...</i>"
+                            }
+
+                        // Branch list: GitLab paginates (100/page). UI cap = env CX_GITLAB_BRANCH_UI_LIMIT. Max API pages = CX_GITLAB_BRANCH_MAX_PAGES.
+                        def uiLimitRaw = envVar('CX_GITLAB_BRANCH_UI_LIMIT')
+                        def uiLimit = Math.max(1, (uiLimitRaw?.trim() ? uiLimitRaw.toInteger() : 200))
+                        def maxPagesCfg = (envVar('CX_GITLAB_BRANCH_MAX_PAGES')?.trim() ? envVar('CX_GITLAB_BRANCH_MAX_PAGES').toInteger() : 50)
+                        def perPage = 100
+
+                        def escOpt = { v ->
+                            if (v == null) return ''
+                            return v.toString().replace('&','&amp;').replace('"','&quot;').replace('<','&lt;').replace('>','&gt;')
+                        }
+
+                        def branchFilterJs = /var r=this.closest('.cx-branch-picker');if(!r)return;var s=r.querySelector('select');var q=this.value.trim().toLowerCase();for(var i=0;i<s.options.length;i++){var o=s.options[i];var t=String(o.text||'').toLowerCase();o.hidden=q&&t.indexOf(q)<0;}/
+
+                        def selectedModules = CORE_SELECTED.tokenize(',').collect { it.trim() }
+
+                        def html = "<table style='width:100%; border-collapse: collapse;'>"
+                        html += "<tr style='background:#eee'><th>Module</th><th>Branch</th></tr>"
+
+                        selectedModules.eachWithIndex { moduleName, modIdx ->
+
+                            def branches = []
+                            def sawSuccessfulApi = false
+                            def lastFailureMsg = null
+                            def lastHttpCode = null
+
+                            namespaces.each { namespace ->
+                                if (branches) {
+                                    return
+                                }
+                                try {
+                                    def projectPath = "\${gitOrg}/\${namespace}/\${moduleName}"
+                                    def encodedPath = URLEncoder.encode(projectPath, "UTF-8").replace("+", "%20")
+                                    def allNames = []
+                                    def page = 1
+                                    while (page <= maxPagesCfg) {
+                                        def url = "\${gitlabUrl}/projects/\${encodedPath}/repository/branches?per_page=\${perPage}&page=\${page}"
+                                        def conn = new URL(url).openConnection()
+                                        conn.setRequestProperty("PRIVATE-TOKEN", privateToken)
+
+                                        def code = conn.responseCode
+                                        if (code == 200) {
+                                            def json = new JsonSlurper().parseText(conn.inputStream.text)
+                                            sawSuccessfulApi = true
+                                            if (!json || json.isEmpty()) {
+                                                break
+                                            }
+                                            json.each { allNames << it.name }
+                                            if (json.size() < perPage) {
+                                                break
+                                            }
+                                            page++
+                                        } else {
+                                            lastHttpCode = code
+                                            lastFailureMsg = "GitLab HTTP \${code}"
+                                            break
+                                        }
+                                    }
+                                    // Only show develop* branches (keeps list small vs hundreds of feature branches)
+                                    branches = allNames.unique().findAll { it.startsWith('develop') }.sort()
+                                } catch (Exception e) {
+                                    lastFailureMsg = "Request failed (\${e.class.simpleName})"
+                                }
+                            }
+
+                            def total = branches.size()
+                            def shown = total > uiLimit ? branches.subList(0, uiLimit) : branches
+                            def truncated = total > shown.size()
+                            def preferredBranch = shown ? (shown.find { it == 'develop' } ?: shown[0]) : null
+
+                            html += "<tr>"
+                            html += "<td style='padding:5px;vertical-align:top'><b>\${moduleName}</b></td>"
+                            html += "<td style='padding:5px'>"
+
+                            if (branches) {
+                                def detailsOpen = (modIdx == 0) ? ' open' : ''
+                                html += "<details\${detailsOpen} style='margin:4px 0;border:1px solid #e2e8f0;border-radius:8px;padding:8px;background:#f8fafc'>"
+                                html += "<summary style='cursor:pointer;font-weight:600;outline:none'>Expand branch list — \${total} branch(es)" + (truncated ? " <span style='color:#b45309;font-weight:600'>(UI shows first \${shown.size()})</span>" : "") + "</summary>"
+                                html += "<div style='margin-top:10px'>"
+                                if (truncated) {
+                                    html += "<p style='margin:0 0 8px 0;font-size:12px;color:#64748b'>Showing the first <b>\${shown.size()}</b> of <b>\${total}</b> alphabetically. Raise <code>CX_GITLAB_BRANCH_UI_LIMIT</code> (global env) if needed.</p>"
+                                }
+                                html += '<div class="cx-branch-picker">'
+                                html += '<label style="display:block;font-size:12px;margin:0 0 6px 0;color:#334155;font-weight:600">Filter branches</label>'
+                                html += '<input type="search" placeholder="Type to filter branch list…" autocomplete="off" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;margin:0 0 8px 0" oninput="' + branchFilterJs + '" />'
+                                html += "<select name='value' size='10' style='width:100%;max-height:260px'>"
+                                if (shown.size() > 80) {
+                                    def groups = shown.groupBy { b ->
+                                        if (!b) return '#'
+                                        def c = b.substring(0, 1)
+                                        if (c >= 'a' && c <= 'z') return c.toUpperCase()
+                                        if (c >= 'A' && c <= 'Z') return c
+                                        return '#'
+                                    }
+                                    groups.keySet().sort().each { letter ->
+                                        html += "<optgroup label='\${letter}'>"
+                                        groups[letter].each { branch ->
+                                            def sel = (branch == preferredBranch) ? ' selected' : ''
+                                            def val = escOpt(moduleName + ':' + branch)
+                                            html += "<option value='\${val}'\${sel}>\${escOpt(branch)}</option>"
+                                        }
+                                        html += "</optgroup>"
+                                    }
+                                } else {
+                                    shown.each { branch ->
+                                        def sel = (branch == preferredBranch) ? ' selected' : ''
+                                        def val = escOpt(moduleName + ':' + branch)
+                                        html += "<option value='\${val}'\${sel}>\${escOpt(branch)}</option>"
+                                    }
+                                }
+                                html += "</select></div></div></details>"
+                            } else if (sawSuccessfulApi) {
+                                html += "<span style='color:#b45309'><i>No branches matching <code>develop*</code> for this module (GitLab responded OK).</i></span>"
+                            } else {
+                                def detail = lastFailureMsg ?: (lastHttpCode != null ? "HTTP \${lastHttpCode}" : "Could not reach GitLab")
+                                html += "<span style='color:red'><b>Could not load branches.</b> \${detail}</span>"
+                            }
+
+                            html += "</td></tr>"
+                        }
+                        
+                        html += "</table>"
+                        return html
+                    """
+                ],
+                // Sandbox fallback when main script cannot run: show error (no fake branch list)
+                fallbackScript: [$class: 'SecureGroovyScript', sandbox: true, script: """
+                    if (CORE_SELECTED == null || CORE_SELECTED == "") return "<i>Select modules above...</i>"
+                    return "<b style='color:red'>Error loading branches</b>"
+                """]
+            ]
+        ],
+        [$class: 'CascadeChoiceParameter',
+            name: 'INST_SELECTED',
+            choiceType: 'PT_CHECKBOX',
+            script: [
+                $class: 'GroovyScript',
+                script: [$class: 'SecureGroovyScript', sandbox: false, script: """
+                    import jenkins.model.Jenkins
+                    import hudson.slaves.EnvironmentVariablesNodeProperty
+                    String envVar(String n) {
+                        def s = System.getenv(n)
+                        if (s) return s
+                        try {
+                            for (p in Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)) {
+                                def v = p.getEnvVars().get(n, '')?.toString()?.trim()
+                                if (v) return v
+                            }
+                        } catch (Throwable e) { }
+                        return ''
+                    }
+                    def installerModules = (envVar('CX_INSTALLER_MODULE_IDS') ?: '')
+                        .split(',')
+                        .collect { it.trim() }
+                        .findAll { it }
+                    return installerModules
+                """],
+                fallbackScript: [$class: 'SecureGroovyScript', sandbox: true, script: "return []"]
+            ]
+        ],
+        [$class: 'DynamicReferenceParameter',
+            name: 'INST_BRANCH_CHOICES',
+            referencedParameters: 'INST_SELECTED',
+            choiceType: 'ET_FORMATTED_HTML',
+            script: [
+                $class: 'GroovyScript',
+                script: [
+                    $class: 'SecureGroovyScript',
+                    sandbox: false,
+                    // IMPORTANT: Replace 'gitlab-token' with the actual ID of your Jenkins Secret Text credential
+                    // containing the GitLab private token.
+                    script: """
+                        import groovy.json.JsonSlurper
+                        import java.net.URL
+                        import java.net.URLEncoder
+                        import jenkins.model.Jenkins
+                        import com.cloudbees.plugins.credentials.CredentialsProvider
+                        import org.jenkinsci.plugins.plaincredentials.StringCredentials
+                        import hudson.slaves.EnvironmentVariablesNodeProperty
+                        
+                        String envVar(String n) {
+                            def s = System.getenv(n)
+                            if (s) return s
+                            try {
+                                for (p in Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)) {
+                                    def v = p.getEnvVars().get(n, '')?.toString()?.trim()
+                                    if (v) return v
+                                }
+                            } catch (Throwable e) { }
+                            return ''
+                        }
+                        
+                        def gitlabUrl = (envVar('CX_GITLAB_API_URL') ?: '').trim()
+                        def gitOrg = (envVar('CX_GITLAB_ORG') ?: '').trim()
+                        def namespaces = (envVar('CX_GITLAB_NAMESPACES') ?: '')
+                            .split(',')
+                            .collect { it.trim() }
+                            .findAll { it }
+                        def credentialsId = (envVar('CX_GITLAB_TOKEN_CREDENTIAL_ID') ?: '').trim()
+                        
+                        def jenkins = Jenkins.get()
+                        
+                        def creds = CredentialsProvider.lookupCredentials(
+                                StringCredentials.class,
+                                jenkins,
+                                null,
+                                null
+                        ).find { it.id == credentialsId }
+                        
+                        if (!creds) {
+                            return "<b style='color:red'>GitLab credential not found</b>"
+                        }
+                        
+                        def privateToken = creds.secret.plainText
+                        
+                        if (!INST_SELECTED) {
+                            return "<i>Select modules above...</i>"
+                            }
+
+                        def uiLimitRawI = envVar('CX_GITLAB_BRANCH_UI_LIMIT')
+                        def uiLimitI = Math.max(1, (uiLimitRawI?.trim() ? uiLimitRawI.toInteger() : 200))
+                        def maxPagesCfgI = (envVar('CX_GITLAB_BRANCH_MAX_PAGES')?.trim() ? envVar('CX_GITLAB_BRANCH_MAX_PAGES').toInteger() : 50)
+                        def perPageI = 100
+
+                        def escOptI = { v ->
+                            if (v == null) return ''
+                            return v.toString().replace('&','&amp;').replace('"','&quot;').replace('<','&lt;').replace('>','&gt;')
+                        }
+
+                        def branchFilterJs = /var r=this.closest('.cx-branch-picker');if(!r)return;var s=r.querySelector('select');var q=this.value.trim().toLowerCase();for(var i=0;i<s.options.length;i++){var o=s.options[i];var t=String(o.text||'').toLowerCase();o.hidden=q&&t.indexOf(q)<0;}/
+
+                        def selectedModules = INST_SELECTED.tokenize(',').collect { it.trim() }
+
+                        def html = "<table style='width:100%; border-collapse: collapse;'>"
+                        html += "<tr style='background:#eee'><th>Module</th><th>Branch</th></tr>"
+
+                        selectedModules.eachWithIndex { moduleName, modIdx ->
+
+                            def branches = []
+                            def sawSuccessfulApi = false
+                            def lastFailureMsg = null
+                            def lastHttpCode = null
+
+                            namespaces.each { namespace ->
+                                if (branches) {
+                                    return
+                                }
+                                try {
+                                    def projectPath = "\${gitOrg}/\${namespace}/\${moduleName}"
+                                    def encodedPath = URLEncoder.encode(projectPath, "UTF-8").replace("+", "%20")
+                                    def allNames = []
+                                    def page = 1
+                                    while (page <= maxPagesCfgI) {
+                                        def url = "\${gitlabUrl}/projects/\${encodedPath}/repository/branches?per_page=\${perPageI}&page=\${page}"
+                                        def conn = new URL(url).openConnection()
+                                        conn.setRequestProperty("PRIVATE-TOKEN", privateToken)
+
+                                        def code = conn.responseCode
+                                        if (code == 200) {
+                                            def json = new JsonSlurper().parseText(conn.inputStream.text)
+                                            sawSuccessfulApi = true
+                                            if (!json || json.isEmpty()) {
+                                                break
+                                            }
+                                            json.each { allNames << it.name }
+                                            if (json.size() < perPageI) {
+                                                break
+                                            }
+                                            page++
+                                        } else {
+                                            lastHttpCode = code
+                                            lastFailureMsg = "GitLab HTTP \${code}"
+                                            break
+                                        }
+                                    }
+                                    // Only show develop* branches
+                                    branches = allNames.unique().findAll { it.startsWith('develop') }.sort()
+                                } catch (Exception e) {
+                                    lastFailureMsg = "Request failed (\${e.class.simpleName})"
+                                }
+                            }
+
+                            def total = branches.size()
+                            def shown = total > uiLimitI ? branches.subList(0, uiLimitI) : branches
+                            def truncated = total > shown.size()
+                            def preferredBranchI = shown ? (shown.find { it == 'develop' } ?: shown[0]) : null
+
+                            html += "<tr>"
+                            html += "<td style='padding:5px;vertical-align:top'><b>\${moduleName}</b></td>"
+                            html += "<td style='padding:5px'>"
+
+                            if (branches) {
+                                def detailsOpen = (modIdx == 0) ? ' open' : ''
+                                html += "<details\${detailsOpen} style='margin:4px 0;border:1px solid #e2e8f0;border-radius:8px;padding:8px;background:#f8fafc'>"
+                                html += "<summary style='cursor:pointer;font-weight:600;outline:none'>Expand branch list — \${total} branch(es)" + (truncated ? " <span style='color:#b45309;font-weight:600'>(UI shows first \${shown.size()})</span>" : "") + "</summary>"
+                                html += "<div style='margin-top:10px'>"
+                                if (truncated) {
+                                    html += "<p style='margin:0 0 8px 0;font-size:12px;color:#64748b'>Showing the first <b>\${shown.size()}</b> of <b>\${total}</b> alphabetically. Raise <code>CX_GITLAB_BRANCH_UI_LIMIT</code> (global env) if needed.</p>"
+                                }
+                                html += '<div class="cx-branch-picker">'
+                                html += '<label style="display:block;font-size:12px;margin:0 0 6px 0;color:#334155;font-weight:600">Filter branches</label>'
+                                html += '<input type="search" placeholder="Type to filter branch list…" autocomplete="off" style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #cbd5e1;border-radius:6px;margin:0 0 8px 0" oninput="' + branchFilterJs + '" />'
+                                html += "<select name='value' size='10' style='width:100%;max-height:260px'>"
+                                if (shown.size() > 80) {
+                                    def groups = shown.groupBy { b ->
+                                        if (!b) return '#'
+                                        def c = b.substring(0, 1)
+                                        if (c >= 'a' && c <= 'z') return c.toUpperCase()
+                                        if (c >= 'A' && c <= 'Z') return c
+                                        return '#'
+                                    }
+                                    groups.keySet().sort().each { letter ->
+                                        html += "<optgroup label='\${letter}'>"
+                                        groups[letter].each { branch ->
+                                            def sel = (branch == preferredBranchI) ? ' selected' : ''
+                                            def val = escOptI(moduleName + ':' + branch)
+                                            html += "<option value='\${val}'\${sel}>\${escOptI(branch)}</option>"
+                                        }
+                                        html += "</optgroup>"
+                                    }
+                                } else {
+                                    shown.each { branch ->
+                                        def sel = (branch == preferredBranchI) ? ' selected' : ''
+                                        def val = escOptI(moduleName + ':' + branch)
+                                        html += "<option value='\${val}'\${sel}>\${escOptI(branch)}</option>"
+                                    }
+                                }
+                                html += "</select></div></div></details>"
+                            } else if (sawSuccessfulApi) {
+                                html += "<span style='color:#b45309'><i>No branches matching <code>develop*</code> for this module (GitLab responded OK).</i></span>"
+                            } else {
+                                def detail = lastFailureMsg ?: (lastHttpCode != null ? "HTTP \${lastHttpCode}" : "Could not reach GitLab")
+                                html += "<span style='color:red'><b>Could not load branches.</b> \${detail}</span>"
+                            }
+
+                            html += "</td></tr>"
+                        }
+                        
+                        html += "</table>"
+                        return html
+                    """
+                ],
+                fallbackScript: [$class: 'SecureGroovyScript', sandbox: true, script: "return '<b>Error loading branches</b>'"]
+            ]
+        ],
+        [$class: 'ExtendedChoiceParameterDefinition', name: 'jdk_version', type: 'PT_CHECKBOX', value: jdkChoiceValues, defaultValue: jdkChoiceDefault]
+        // Note: BUILD_TYPE is hardcoded to 'snapshot' for this pipeline (final-cipipeline)
+    ])
+])
+}
+
+pipeline {
+    agent any
+
+    environment {
+        // Snapshot vs release: BUILD_TYPE here; all other globals — see vars/cxPipelineConfig.groovy.
+        // Mirror paths: optional GIT_LOCAL_MIRROR_BASE / GIT_ORG_DIR on the controller; effective values are
+        // env.EFFECTIVE_* set by cxPipelineConfig() in stage "Validate global configuration".
+        BUILD_TYPE = 'snapshot'
+    }
+
+    stages {
+        stage('Register job parameters') {
+            steps {
+                script {
+                    try {
+                        registerCxCiJobParameters(env)
+                        echo '✅ Job parameter definitions applied (refresh the job page once; next runs use Build with Parameters).'
+                        echo "   CX_JDK_VERSION_OPTIONS resolved for Extended Choice: ${resolveEnvWithPipeline('CX_JDK_VERSION_OPTIONS', env) ?: '(empty — fallback jdk-17)'}"
+                    } catch (Throwable t) {
+                        echo "❌ registerCxCiJobParameters failed: ${t.class.name}: ${t.message}"
+                        throw t
+                    }
+                }
+            }
+        }
+
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    // Fail fast with a clear list of missing Manage Jenkins → Global properties env vars.
+                    // Same effective security-tools flag as executeChainBuild / buildModulesWithJDK (Option A: one cxPipelineConfig per run).
+                    def getDefaultsScript = loadSharedLibVarScript('getDefaults')
+                    def runSecurityToolsParams = loadSharedLibVarScript('runSecurityToolsParams')
+                    boolean globalSecurityTools = getDefaultsScript != null && getDefaultsScript.getRunSecurityTools()
+                    boolean jobRunSecurityTools = runSecurityToolsParams.resolveJobRunSecurityTools(null)
+                    boolean effectiveForCfg = globalSecurityTools && jobRunSecurityTools
+                    def cfg = cxPipelineConfig(effectiveForCfg)
+                    def serde = loadSharedLibVarScript('pipelineConfigSerde')
+                    if (serde) {
+                        env.CX_PIPELINE_CFG_JSON = serde.pipelineConfigToJson(cfg)
+                    } else {
+                        echo '⚠️ pipelineConfigSerde not in shared library — parallel JDK cells will call cxPipelineConfig() again (Option A inactive).'
+                    }
+                    echo '✅ cxPipelineConfig: required globals present (see vars/cxPipelineConfig.groovy header for the full list).'
+                    echo "   Resolved: gitOrg=${cfg.gitOrg}, gitHost=${cfg.gitHost}, buildTypeSuffix=${cfg.buildTypeSuffix}"
+                    echo "   Resolved: nexusBaseUrl=${cfg.nexusBaseUrl}, m2DebugEffective=${cfg.m2DebugExplicit}"
+                    echo "   Credential IDs (not secrets): gitHttp=${cfg.gitHttpCredentialId}, nexus=${cfg.nexusCredentialId}"
+                    echo "   Mirror cleanup: EFFECTIVE_GIT_LOCAL_MIRROR_BASE=${cfg.effectiveGitLocalMirrorBase}, EFFECTIVE_GIT_ORG_DIR=${cfg.effectiveGitOrgDir}"
+                    echo "   React CI strict (export CI): ${cfg.reactCiExport} (global CX_REACT_CI_STRICT; default false — see vars/resolveReactCiEnv.groovy)"
+                    if (cfg.sonarBaseUrl) {
+                        echo "   Sonar: ${cfg.sonarBaseUrl}, env=${cfg.sonarQubeEnvName}, DT=${cfg.dependencyTrackInstance}"
+                    }
+                }
+            }
+        }
+
+        stage('Initialize & Clean') {
+            steps {
+                script {
+                    def mirrorRoot = env.EFFECTIVE_GIT_LOCAL_MIRROR_BASE?.trim()
+                    def orgDir = env.EFFECTIVE_GIT_ORG_DIR?.trim()
+                    if (mirrorRoot && orgDir) {
+                        def target = "${mirrorRoot}/${orgDir}"
+                        echo "=== Org mirror cleanup: rm -rf enabled for ${target} ==="
+                        sh """
+                            #echo "--- ls -la ${mirrorRoot} (effective mirror root) ---"
+                            #ls -la '${mirrorRoot}' || echo "mirror root missing or not readable"
+                            #echo "--- ls -la ${target} (org target before delete, if present) ---"
+                            #if [ -d '${target}' ]; then ls -la '${target}'; else echo "target dir does not exist: ${target}"; fi
+                            if [ -d '${target}' ]; then
+                              rm -rf '${target}'
+                            fi
+                        """
+                    } else {
+                        echo 'Skipping org mirror cleanup: EFFECTIVE_GIT_LOCAL_MIRROR_BASE or EFFECTIVE_GIT_ORG_DIR empty.'
+                    }
+                }
+                // Prefer Jenkins-managed workspace cleanup instead of shell `rm -rf $WORKSPACE`:
+                // uses the Workspace Cleanup plugin, skips failing the job on locked files when possible,
+                // and avoids ad-hoc paths outside the workspace.
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+            }
+        }
+
+        stage("Process Selection & Execution") {
+            steps {
+                script {
+                    // Parse order-independent module→branch mapping from "moduleName:branchName" format
+                    def parseModuleBranchMap = { branchChoicesStr ->
+                        def moduleBranchMap = [:]
+                        if (branchChoicesStr && branchChoicesStr.trim()) {
+                            branchChoicesStr.tokenize(',').each { choice ->
+                                def parts = choice.trim().split(':', 2)
+                                if (parts.length == 2) {
+                                    def modName = parts[0].trim()
+                                    def branchName = parts[1].trim()
+                                    moduleBranchMap[modName] = branchName
+                                }
+                            }
+                        }
+                        return moduleBranchMap
+                    }
+                    
+                    // --- Module selection + chain-order resolution ---
+                    def coreModuleList = (params.CORE_SELECTED ?: "").tokenize(',').collect { it.trim() }.findAll { it }
+                    def coreBranchMap = parseModuleBranchMap(params.CORE_BRANCH_CHOICES ?: "")
+                    def instModuleList = (params.INST_SELECTED ?: "").tokenize(',').collect { it.trim() }.findAll { it }
+                    def instBranchMap = parseModuleBranchMap(params.INST_BRANCH_CHOICES ?: "")
+
+                    def chainOrderList = (env.CX_CHAIN_ORDER ?: "").tokenize(',').collect { it.trim() }.findAll { it }
+                    def chainIndexMap = [:]
+                    chainOrderList.eachWithIndex { moduleName, idx ->
+                        if (!chainIndexMap.containsKey(moduleName)) {
+                            chainIndexMap[moduleName] = idx
+                        }
+                    }
+
+                    def orderModulesByChain = { List<String> modules ->
+                        def normalized = (modules ?: []).collect { it?.toString()?.trim() }.findAll { it }
+                        def ordered = []
+                        def selectedSet = normalized as Set
+                        chainOrderList.each { chainMod ->
+                            if (selectedSet.contains(chainMod)) {
+                                ordered << chainMod
+                            }
+                        }
+                        normalized.each { modName ->
+                            if (!chainIndexMap.containsKey(modName) && !ordered.contains(modName)) {
+                                ordered << modName
+                            }
+                        }
+                        return ordered
+                    }
+                    def warnIfMissingInChain = { List<String> modules, String laneName ->
+                        def missing = (modules ?: []).findAll { it && !chainIndexMap.containsKey(it) }.unique()
+                        if (!missing.isEmpty()) {
+                            echo "⚠️ ${laneName} module(s) missing in CX_CHAIN_ORDER (placed at end): ${missing.join(', ')}"
+                        }
+                    }
+
+                    def sequentialInstallerSpecialSet = ['cc'] as Set
+                    def sequentialInstallerModules = instModuleList.findAll { sequentialInstallerSpecialSet.contains(it) }
+                    def parallelInstallerModules = instModuleList.findAll { !sequentialInstallerSpecialSet.contains(it) }
+
+                    warnIfMissingInChain(coreModuleList, 'core')
+                    warnIfMissingInChain(instModuleList, 'installer')
+
+                    def orderedCoreModuleList = orderModulesByChain(coreModuleList)
+                    def orderedSequentialInstallerModules = orderModulesByChain(sequentialInstallerModules)
+                    def orderedParallelInstallerModules = orderModulesByChain(parallelInstallerModules)
+
+                    // Sequential lane: all selected core modules + selected special installer modules (e.g. cc) in chain order.
+                    def sequentialBuildPlan = []
+                    def sequentialInstallerSet = orderedSequentialInstallerModules as Set
+                    def coreSet = orderedCoreModuleList as Set
+                    def orderedSequentialNames = []
+                    chainOrderList.each { chainMod ->
+                        if (coreSet.contains(chainMod) || sequentialInstallerSet.contains(chainMod)) {
+                            orderedSequentialNames << chainMod
+                        }
+                    }
+                    // Keep unknown modules at the end in original lane order.
+                    orderedCoreModuleList.each { modName ->
+                        if (!chainIndexMap.containsKey(modName) && !orderedSequentialNames.contains(modName)) {
+                            orderedSequentialNames << modName
+                        }
+                    }
+                    orderedSequentialInstallerModules.each { modName ->
+                        if (!chainIndexMap.containsKey(modName) && !orderedSequentialNames.contains(modName)) {
+                            orderedSequentialNames << modName
+                        }
+                    }
+                    orderedSequentialNames.each { modName ->
+                        if (coreSet.contains(modName)) {
+                            sequentialBuildPlan << [moduleName: modName, isCoreType: true, branchName: coreBranchMap[modName]]
+                        } else {
+                            sequentialBuildPlan << [moduleName: modName, isCoreType: false, branchName: instBranchMap[modName]]
+                        }
+                    }
+
+                    if (!sequentialBuildPlan.isEmpty()) {
+                        echo "Starting sequential build in chain order for ${sequentialBuildPlan.size()} module(s): ${sequentialBuildPlan.collect { it.moduleName }.join(', ')}"
+                        sequentialBuildPlan.each { item ->
+                            def modName = item.moduleName
+                            def targetBranch = item.branchName?.toString()?.trim()
+                            def moduleLabel = item.isCoreType ? 'core module' : 'installer module'
+                            if (!targetBranch) {
+                                def branchParamName = item.isCoreType ? 'CORE_BRANCH_CHOICES' : 'INST_BRANCH_CHOICES'
+                                error "❌ No branch selected for ${moduleLabel} '${modName}'. Use ${branchParamName} to assign branch per module."
+                            }
+                            echo "🏗️ TRIGGER ${item.isCoreType ? 'CORE' : 'SEQ-INSTALLER'}: [${modName}] ON [${targetBranch}]"
+                            executeChainBuild(
+                                selectedModulesList: [modName],
+                                jdkVersions: params.jdk_version,
+                                cxSmgBase: env.CX_SMG_BASE_GLOBAL,
+                                isCoreType: item.isCoreType as boolean,
+                                customBranchOverride: targetBranch
+                            )
+                        }
+                    } else {
+                        echo "No sequential modules selected. Skipping sequential build lane."
+                    }
+
+                    // --- Remaining installer modules: Parallel Build (All at once) ---
+                    if (!orderedParallelInstallerModules.isEmpty()) {
+                        def parallelTasks = [:]
+                        orderedParallelInstallerModules.each { modName ->
+                            def targetBranch = instBranchMap[modName]
+                            if (!targetBranch?.trim()) {
+                                error "❌ No branch selected for installer module '${modName}'. Use INST_BRANCH_CHOICES to assign branch per module."
+                            }
+                            echo "🏗️ PREPARING PARALLEL: [${modName}] ON [${targetBranch}]"
+                            parallelTasks["build-${modName}"] = {
+                                stage("Build ${modName}") {
+                                    executeChainBuild(
+                                        selectedModulesList: [modName],
+                                        jdkVersions: params.jdk_version,
+                                        cxSmgBase: env.CX_SMG_BASE_GLOBAL,
+                                        isCoreType: false,
+                                        customBranchOverride: targetBranch
+                                    )
+                                }
+                            }
+                        }
+                        echo "🚀 Starting PARALLEL build for ${orderedParallelInstallerModules.size()} installer module(s): ${orderedParallelInstallerModules.join(', ')}"
+                        parallel parallelTasks
+                    } else {
+                        echo "No parallel installer modules selected. Skipping installer parallel stage."
+                    }
+
+                    // --- Publish Sonar Report: one page with all metrics and quality gate pass/fail ---
+                    def allModulesForSonar = []
+                    orderedCoreModuleList.each { modName ->
+                        def b = coreBranchMap[modName]
+                        if (!b?.trim()) {
+                            error "❌ Cannot publish Sonar report: branch missing for core module '${modName}'."
+                        }
+                        allModulesForSonar << [moduleName: modName, branchName: b]
+                    }
+                    (orderedSequentialInstallerModules + orderedParallelInstallerModules).each { modName ->
+                        def b = instBranchMap[modName]
+                        if (!b?.trim()) {
+                            error "❌ Cannot publish Sonar report: branch missing for installer module '${modName}'."
+                        }
+                        allModulesForSonar << [moduleName: modName, branchName: b]
+                    }
+                    if (!allModulesForSonar.isEmpty()) {
+                        publishSonarReport(
+                            modules: allModulesForSonar,
+                            reportName: 'Sonar Report',
+                            failOnError: false
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo "Job Result: ${currentBuild.result}"
+            }
+        }
+    }
+}

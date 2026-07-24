@@ -1,0 +1,188 @@
+// Nightly SNAPSHOT CI — scheduled build of all core + installer modules (no release/tag pipelines).
+// Configure via Jenkins global properties; see vars/cxPipelineConfig.groovy and vars/getDefaults.groovy.
+@Library('customerxp-jenkins-shared-library@develop') _
+
+import hudson.slaves.EnvironmentVariablesNodeProperty
+import jenkins.model.Jenkins
+
+String readGlobalOrSystemEnv(String name) {
+    def v = System.getenv(name)?.toString()?.trim()
+    if (v) {
+        return v
+    }
+    try {
+        def props = Jenkins.get().getGlobalNodeProperties().getAll(EnvironmentVariablesNodeProperty.class)
+        for (p in props) {
+            def ev = p.getEnvVars().get(name, '')?.toString()?.trim()
+            if (ev) {
+                return ev
+            }
+        }
+    } catch (Throwable ignored) { }
+    return ''
+}
+
+String resolveEnvWithPipeline(String name, Object pipelineEnv = null) {
+    if (pipelineEnv != null) {
+        try {
+            def map = pipelineEnv.getEnvironment()
+            def v = map?.get(name)
+            if (v != null && v.toString().trim()) {
+                return v.toString().trim()
+            }
+        } catch (Throwable ignored) { }
+        try {
+            def v2 = pipelineEnv[name]
+            if (v2 != null && v2.toString().trim()) {
+                return v2.toString().trim()
+            }
+        } catch (Throwable ignored2) { }
+    }
+    return readGlobalOrSystemEnv(name)
+}
+
+pipeline {
+    agent any
+
+    stages {
+        stage('Register job parameters') {
+            steps {
+                script {
+                    def buildType = resolveEnvWithPipeline('BUILD_TYPE', env)?.trim()
+                    if (!buildType) {
+                        error '❌ Nightly CI: set BUILD_TYPE in Jenkins global properties (e.g. snapshot).'
+                    }
+                    env.BUILD_TYPE = buildType
+
+                    registerNightlyCiJobParameters(env)
+                    def getDefaultsScript = loadSharedLibVarScript('getDefaults')
+                    def cronExpr = resolveEnvWithPipeline('JENKINS_CRON_SCHEDULE', env) ?: getDefaultsScript.getCronSchedule()
+                    echo "✅ Nightly SNAPSHOT CI parameters registered (cron: ${cronExpr}; controller timezone)."
+                    echo "   BUILD_TYPE=${env.BUILD_TYPE} | modules: CX_CORE_MODULE_IDS + CX_INSTALLER_MODULE_IDS"
+                }
+            }
+        }
+
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    def getDefaultsScript = loadSharedLibVarScript('getDefaults')
+                    def runSecurityToolsParams = loadSharedLibVarScript('runSecurityToolsParams')
+                    boolean globalSecurityTools = getDefaultsScript != null && getDefaultsScript.getRunSecurityTools()
+                    def securityParam = params.RUN_SECURITY_TOOLS != null
+                        ? params.RUN_SECURITY_TOOLS
+                        : getDefaultsScript.getRunSecurityTools()
+                    boolean jobRunSecurityTools = runSecurityToolsParams.resolveJobRunSecurityTools(securityParam)
+                    boolean effectiveForCfg = globalSecurityTools && jobRunSecurityTools
+                    def cfg = cxPipelineConfig(effectiveForCfg)
+                    def serde = loadSharedLibVarScript('pipelineConfigSerde')
+                    if (serde) {
+                        env.CX_PIPELINE_CFG_JSON = serde.pipelineConfigToJson(cfg)
+                    }
+                    echo '✅ Nightly cxPipelineConfig validated (RUN_SECURITY_TOOLS + JENKINS_RUN_SECURITY_TOOLS).'
+                    echo "   gitOrg=${cfg.gitOrg}, buildTypeSuffix=${cfg.buildTypeSuffix}, nexusBaseUrl=${cfg.nexusBaseUrl}"
+                    echo "   React CI strict (export CI): ${cfg.reactCiExport} (global CX_REACT_CI_STRICT; default false — see vars/resolveReactCiEnv.groovy)"
+                }
+            }
+        }
+
+        stage('Initialize & Clean') {
+            steps {
+                script {
+                    def mirrorRoot = env.EFFECTIVE_GIT_LOCAL_MIRROR_BASE?.trim()
+                    def orgDir = env.EFFECTIVE_GIT_ORG_DIR?.trim()
+                    if (mirrorRoot && orgDir) {
+                        def target = "${mirrorRoot}/${orgDir}"
+                        echo "=== Org mirror cleanup: ${target} ==="
+                        sh """
+                            if [ -d '${target}' ]; then
+                              rm -rf '${target}'
+                            fi
+                        """
+                    } else {
+                        echo 'Skipping org mirror cleanup: EFFECTIVE_GIT_LOCAL_MIRROR_BASE or EFFECTIVE_GIT_ORG_DIR empty.'
+                    }
+                }
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+            }
+        }
+
+        stage('Resolve nightly module plan') {
+            steps {
+                script {
+                    def selection = resolveNightlyCiSelection(
+                        env: env,
+                        jdkVersionParam: params.jdk_version,
+                        runSecurityToolsParam: params.RUN_SECURITY_TOOLS
+                    )
+                    env.CX_NIGHTLY_JDK_RESOLVED = selection.jdkVersions
+                    env.CX_NIGHTLY_SECURITY_TOOLS = selection.runSecurityTools.toString()
+
+                    def allModules = (selection.coreModuleList + selection.instModuleList).unique()
+                    echo "Nightly modules (${allModules.size()}): ${allModules.join(', ')}"
+                    echo "JDK: ${selection.jdkVersions} | Security tools: ${selection.runSecurityTools}"
+
+                    def branchMap = resolveNightlyBranchMap(allModules)
+                    env.CX_NIGHTLY_CORE_MODULES = selection.coreModuleList.join(',')
+                    env.CX_NIGHTLY_INST_MODULES = selection.instModuleList.join(',')
+
+                    def coreBranchMap = [:]
+                    selection.coreModuleList.each { mod ->
+                        coreBranchMap[mod] = branchMap[mod]
+                    }
+                    def instBranchMap = [:]
+                    selection.instModuleList.each { mod ->
+                        instBranchMap[mod] = branchMap[mod]
+                    }
+
+                    env.CX_NIGHTLY_CORE_BRANCH_JSON = groovy.json.JsonOutput.toJson(coreBranchMap)
+                    env.CX_NIGHTLY_INST_BRANCH_JSON = groovy.json.JsonOutput.toJson(instBranchMap)
+                }
+            }
+        }
+
+        stage('Nightly SNAPSHOT build') {
+            steps {
+                script {
+                    def selection = resolveNightlyCiSelection(
+                        env: env,
+                        jdkVersionParam: params.jdk_version,
+                        runSecurityToolsParam: params.RUN_SECURITY_TOOLS
+                    )
+                    def coreBranchMap = new groovy.json.JsonSlurper().parseText(env.CX_NIGHTLY_CORE_BRANCH_JSON ?: '{}')
+                    def instBranchMap = new groovy.json.JsonSlurper().parseText(env.CX_NIGHTLY_INST_BRANCH_JSON ?: '{}')
+                    def cxSmgBase = resolveEnvWithPipeline('CX_SMG_BASE_GLOBAL', env)
+                    if (!cxSmgBase?.trim()) {
+                        error '❌ Nightly CI: CX_SMG_BASE_GLOBAL must be set in Jenkins global properties.'
+                    }
+
+                    executeNightlySnapshotBuild(
+                        coreModuleList: selection.coreModuleList,
+                        instModuleList: selection.instModuleList,
+                        coreBranchMap: coreBranchMap,
+                        instBranchMap: instBranchMap,
+                        jdkVersions: selection.jdkVersions,
+                        cxSmgBase: cxSmgBase,
+                        runSecurityTools: selection.runSecurityTools
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "Nightly SNAPSHOT CI result: ${currentBuild.result ?: 'SUCCESS'}"
+        }
+        failure {
+            script {
+                sendCiFailureEmail()
+            }
+        }
+        unstable {
+            script {
+                sendCiFailureEmail()
+            }
+        }
+    }
+}
