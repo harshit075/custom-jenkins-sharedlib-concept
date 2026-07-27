@@ -1,0 +1,69 @@
+{
+  "version": "1.0.0",
+  "description": "Module registry for full-cx-ci pipeline (CustomerXP architecture replica using public GitHub repos)",
+  "modules": [
+    {
+      "id": "2048",
+      "displayName": "2048 Game (Core)",
+      "type": "core",
+      "chainOrder": 0,
+      "repoUrl": "https://github.com/gabrielecirulli/2048.git",
+      "defaultBranch": "master",
+      "projectType": "static-site"
+    },
+    {
+      "id": "markdown-here",
+      "displayName": "Markdown Here (Core)",
+      "type": "core",
+      "chainOrder": 1,
+      "repoUrl": "https://github.com/adam-p/markdown-here.git",
+      "defaultBranch": "master",
+      "projectType": "unknown"
+    },
+    {
+      "id": "flask",
+      "displayName": "Flask (Core)",
+      "type": "core",
+      "chainOrder": 2,
+      "repoUrl": "https://github.com/pallets/flask.git",
+      "defaultBranch": "main",
+      "projectType": "python"
+    },
+    {
+      "id": "express",
+      "displayName": "Express.js (Core)",
+      "type": "core",
+      "chainOrder": 3,
+      "repoUrl": "https://github.com/expressjs/express.git",
+      "defaultBranch": "master",
+      "projectType": "nodejs"
+    },
+    {
+      "id": "html5-boilerplate",
+      "displayName": "HTML5 Boilerplate (Installer)",
+      "type": "installer",
+      "chainOrder": 4,
+      "repoUrl": "https://github.com/h5bp/html5-boilerplate.git",
+      "defaultBranch": "main",
+      "projectType": "nodejs"
+    },
+    {
+      "id": "you-dont-need-js",
+      "displayName": "You Don't Need JavaScript (Installer)",
+      "type": "installer",
+      "chainOrder": 5,
+      "repoUrl": "https://github.com/you-dont-need/You-Dont-Need-JavaScript.git",
+      "defaultBranch": "master",
+      "projectType": "static-site"
+    },
+    {
+      "id": "spring-petclinic",
+      "displayName": "Spring PetClinic (Installer)",
+      "type": "installer",
+      "chainOrder": 6,
+      "repoUrl": "https://github.com/spring-projects/spring-petclinic.git",
+      "defaultBranch": "main",
+      "projectType": "java-maven"
+    }
+  ]
+}

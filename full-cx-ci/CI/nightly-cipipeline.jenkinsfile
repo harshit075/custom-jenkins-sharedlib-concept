@@ -1,0 +1,83 @@
+// nightly-cipipeline.jenkinsfile
+//
+// EXACT REPLICA OF: CustomerXP CI/nightly-cipipeline.jenkinsfile
+//
+// Scheduled nightly snapshot build. Runs on cron, builds ALL configured
+// modules, sends failure email if anything breaks.
+
+@Library('full-cx-ci-lib') _
+
+pipeline {
+    agent any
+
+    environment { BUILD_TYPE = 'snapshot' }
+
+    stages {
+        stage('Register nightly parameters') {
+            steps {
+                script {
+                    echo '  Stage 1: REGISTER NIGHTLY PARAMETERS'
+                    try {
+                        loadSharedLibVarScript('registerNightlyCiJobParameters').call()
+                        echo '✅ Nightly parameters registered (cron + RUN_SECURITY_TOOLS + jdk_version)'
+                    } catch (Throwable t) {
+                        echo "⚠️ registerNightlyCiJobParameters: ${t.message} — continuing"
+                    }
+                }
+            }
+        }
+
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    echo '  Stage 2: VALIDATE GLOBAL CONFIGURATION'
+                    boolean runSec = params.RUN_SECURITY_TOOLS != null ? (params.RUN_SECURITY_TOOLS as boolean) : false
+                    def cfg = cxPipelineConfig(runSec)
+                    def serde = loadSharedLibVarScript('pipelineConfigSerde')
+                    if (serde) env.CX_PIPELINE_CFG_JSON = serde.pipelineConfigToJson(cfg)
+                    echo "✅ Config validated: ${cfg.coreModuleIds.size()} core, ${cfg.installerModuleIds.size()} installer modules"
+                }
+            }
+        }
+
+        stage('Initialize & Clean') {
+            steps {
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+                script { echo '✅ Workspace cleaned' }
+            }
+        }
+
+        stage('Nightly Snapshot Build') {
+            steps {
+                script {
+                    echo '  Stage 4: NIGHTLY SNAPSHOT BUILD'
+                    loadSharedLibVarScript('executeNightlySnapshotBuild').call()
+                }
+            }
+        }
+    }
+
+    post {
+        always  { script { echo "Nightly result: ${currentBuild.result ?: 'SUCCESS'}" } }
+        failure {
+            script {
+                echo '📧 Sending failure notification...'
+                try {
+                    loadSharedLibVarScript('sendCiFailureEmail').call()
+                } catch (Throwable t) {
+                    echo "⚠️ sendCiFailureEmail: ${t.message}"
+                }
+            }
+        }
+        unstable {
+            script {
+                echo '📧 Sending unstable notification...'
+                try {
+                    loadSharedLibVarScript('sendCiFailureEmail').call()
+                } catch (Throwable t) {
+                    echo "⚠️ sendCiFailureEmail: ${t.message}"
+                }
+            }
+        }
+    }
+}

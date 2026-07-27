@@ -1,0 +1,138 @@
+// release-cipipeline.jenkinsfile
+//
+// EXACT REPLICA OF: CustomerXP CI/release-cipipeline.jenkinsfile
+//
+// Release pipeline: builds selected modules from release branches with a release tag.
+// Uses buildModulesWithJDKReleaseTag instead of buildModulesWithJDK.
+
+@Library('full-cx-ci-lib') _
+
+pipeline {
+    agent any
+
+    environment { BUILD_TYPE = 'release' }
+
+    parameters {
+        choice(name: 'CORE_SELECTED',   choices: ['none', '2048', 'markdown-here', 'flask'], description: 'Core modules for release build')
+        choice(name: 'INST_SELECTED',   choices: ['none', 'html5-boilerplate', 'you-dont-need-js', 'spring-petclinic'], description: 'Installer modules for release build')
+        string(name: 'RELEASE_TAG',     defaultValue: 'v1.0.0', description: 'Release tag (e.g. v1.2.3)')
+        choice(name: 'jdk_version',     choices: ['jdk-17', 'jdk-11'], description: 'JDK version for release build')
+        booleanParam(name: 'RUN_SECURITY_TOOLS', defaultValue: false, description: 'Run security tools on release build')
+    }
+
+    stages {
+        stage('Register job parameters') {
+            steps {
+                script {
+                    echo '  Stage 1: REGISTER RELEASE PARAMETERS'
+                    echo "  CORE_SELECTED: ${params.CORE_SELECTED}"
+                    echo "  INST_SELECTED: ${params.INST_SELECTED}"
+                    echo "  RELEASE_TAG:   ${params.RELEASE_TAG}"
+                    echo "  jdk_version:   ${params.jdk_version}"
+                    echo '✅ Release parameters registered'
+                }
+            }
+        }
+
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    echo '  Stage 2: VALIDATE (RELEASE)'
+                    def cfg = cxPipelineConfig(false)
+                    def serde = loadSharedLibVarScript('pipelineConfigSerde')
+                    if (serde) env.CX_PIPELINE_CFG_JSON = serde.pipelineConfigToJson(cfg)
+                    if (!params.RELEASE_TAG?.trim()) error "❌ RELEASE_TAG is required for release pipeline"
+                    echo "✅ Release config validated: tag=${params.RELEASE_TAG}"
+                }
+            }
+        }
+
+        stage('Initialize & Clean') {
+            steps {
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+                script { echo '✅ Workspace cleaned' }
+            }
+        }
+
+        stage('Process Release Selection & Execution') {
+            steps {
+                script {
+                    echo '  Stage 4: RELEASE BUILD EXECUTION'
+                    def cfg = cxPipelineConfig(false)
+                    def moduleSpecialCasesScript = loadSharedLibVarScript('moduleSpecialCases')
+                    def workspaceBase = cfg.workspaceBase ?: env.CX_WORKSPACE_BASE
+                    def releaseTagScript = loadSharedLibVarScript('releasePipelineReleaseTags')
+
+                    def selectedCore = params.CORE_SELECTED == 'none' ? [] : [params.CORE_SELECTED]
+                    def selectedInst = params.INST_SELECTED == 'none' ? [] : [params.INST_SELECTED]
+
+                    def branchMap = [:]
+                    def tagMap = [:]
+                    (selectedCore + selectedInst).each { modName ->
+                        branchMap[modName] = moduleSpecialCasesScript ?
+                            moduleSpecialCasesScript.getDefaultBranch(modName) : 'main'
+                        tagMap[modName] = params.RELEASE_TAG
+                    }
+
+                    echo "📋 Release Build Plan:"
+                    echo "   Sequential (core): ${selectedCore.join(', ') ?: '(none)'}"
+                    echo "   Parallel (installer): ${selectedInst.join(', ') ?: '(none)'}"
+                    echo "   Tag: ${params.RELEASE_TAG}"
+
+                    // Sequential release builds (core)
+                    selectedCore.each { modName ->
+                        def branch = branchMap[modName] ?: 'main'
+                        def tag    = tagMap[modName]
+                        echo "🏷️ RELEASE CHAIN: ${modName} @ ${branch} tag=${tag}"
+                        executeChainBuild(
+                            selectedModulesList: [modName],
+                            jdkVersions: params.jdk_version,
+                            cxSmgBase: workspaceBase,
+                            isCoreType: true,
+                            customBranchOverride: branch,
+                            releaseTag: tag,
+                            runSecurityTools: params.RUN_SECURITY_TOOLS
+                        )
+                    }
+
+                    // Parallel release builds (installers)
+                    if (selectedInst) {
+                        def parallelTasks = [:]
+                        selectedInst.each { modName ->
+                            def branch = branchMap[modName] ?: 'main'
+                            def tag    = tagMap[modName]
+                            parallelTasks["release-${modName}"] = {
+                                stage("Release ${modName}") {
+                                    executeChainBuild(
+                                        selectedModulesList: [modName],
+                                        jdkVersions: params.jdk_version,
+                                        cxSmgBase: workspaceBase,
+                                        isCoreType: false,
+                                        customBranchOverride: branch,
+                                        releaseTag: tag,
+                                        runSecurityTools: params.RUN_SECURITY_TOOLS
+                                    )
+                                }
+                            }
+                        }
+                        parallel parallelTasks
+                    }
+
+                    // Report
+                    def allForReport = []
+                    selectedCore.each { allForReport << [moduleName: it, branchName: branchMap[it] ?: 'main'] }
+                    selectedInst.each  { allForReport << [moduleName: it, branchName: branchMap[it] ?: 'main'] }
+                    if (allForReport) {
+                        publishSonarReport(modules: allForReport, reportName: 'CX Release CI Report', failOnError: false)
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always  { script { echo "Release pipeline result: ${currentBuild.result ?: 'SUCCESS'}" } }
+        success { echo "🎉 Release ${params.RELEASE_TAG} built successfully!" }
+        failure { echo "❌ Release build FAILED for tag ${params.RELEASE_TAG}" }
+    }
+}

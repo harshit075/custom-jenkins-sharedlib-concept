@@ -1,0 +1,269 @@
+// final-cipipeline.jenkinsfile
+//
+// EXACT REPLICA OF: CustomerXP CI/final-cipipeline.jenkinsfile
+//
+// This is the MAIN CI entry point. Same 4-stage structure as CustomerXP:
+//   1. Register job parameters (Build with Parameters UI)
+//   2. Validate global configuration (cxPipelineConfig)
+//   3. Initialize & Clean (workspace wipe)
+//   4. Process Selection & Execution (chain → parallel → report)
+//
+// ADAPTED: Uses public GitHub repos + standard choice parameters
+// instead of Active Choices with GitLab API.
+
+@Library('full-cx-ci-lib') _
+
+pipeline {
+    agent any
+
+    environment {
+        BUILD_TYPE = 'snapshot'
+    }
+
+    parameters {
+        // MAPS TO: CascadeChoiceParameter CORE_SELECTED (from CX_CORE_MODULE_IDS)
+        choice(
+            name: 'CORE_SELECTED',
+            choices: ['all', '2048', 'markdown-here', 'flask', 'express', 'none'],
+            description: 'Core modules to build sequentially (maps to CORE_SELECTED + CORE_BRANCH_CHOICES)'
+        )
+        // MAPS TO: CascadeChoiceParameter INST_SELECTED (from CX_INSTALLER_MODULE_IDS)
+        choice(
+            name: 'INST_SELECTED',
+            choices: ['all', 'html5-boilerplate', 'you-dont-need-js', 'spring-petclinic', 'none'],
+            description: 'Installer modules to build in parallel (maps to INST_SELECTED + INST_BRANCH_CHOICES)'
+        )
+        // MAPS TO: ExtendedChoiceParameterDefinition jdk_version
+        choice(
+            name: 'jdk_version',
+            choices: ['jdk-17', 'jdk-11', 'jdk-17,jdk-11'],
+            description: 'JDK version(s) — multiple = parallel per-module JDK builds'
+        )
+        // MAPS TO: RUN_SECURITY_TOOLS (from runSecurityToolsParams)
+        booleanParam(
+            name: 'RUN_SECURITY_TOOLS',
+            defaultValue: false,
+            description: 'Run security tools (Gitleaks, SBOM, Sonar if configured)'
+        )
+    }
+
+    stages {
+        /**
+         * STAGE 1: Register Job Parameters
+         * CustomerXP: calls registerCxCiJobParameters() with Active Choices
+         * Here: parameters declared above; this stage documents and echoes them
+         */
+        stage('Register job parameters') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════════════'
+                    echo '  Stage 1: REGISTER JOB PARAMETERS'
+                    echo '  (CustomerXP uses Active Choices + GitLab API branch fetch)'
+                    echo '═══════════════════════════════════════════════════════════'
+                    echo "  CORE_SELECTED:   ${params.CORE_SELECTED}"
+                    echo "  INST_SELECTED:   ${params.INST_SELECTED}"
+                    echo "  jdk_version:     ${params.jdk_version}"
+                    echo "  RUN_SECURITY:    ${params.RUN_SECURITY_TOOLS}"
+                    echo '✅ Parameters registered — refresh page for first run'
+                }
+            }
+        }
+
+        /**
+         * STAGE 2: Validate Global Configuration
+         * CustomerXP: calls cxPipelineConfig() + pipelineConfigSerde serialization
+         */
+        stage('Validate global configuration') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════════════'
+                    echo '  Stage 2: VALIDATE GLOBAL CONFIGURATION'
+                    echo '═══════════════════════════════════════════════════════════'
+
+                    def runSecToolsParams = loadSharedLibVarScript('runSecurityToolsParams')
+                    boolean jobRunSecurity = runSecToolsParams.resolveJobRunSecurityTools(params.RUN_SECURITY_TOOLS)
+                    def getDefaultsScript = loadSharedLibVarScript('getDefaults')
+                    boolean globalSecurity = getDefaultsScript ? getDefaultsScript.getRunSecurityTools() : false
+                    boolean effectiveSecurity = globalSecurity && jobRunSecurity
+
+                    def cfg = cxPipelineConfig(effectiveSecurity)
+
+                    // Serialize config for reuse in parallel cells (Option A)
+                    def serde = loadSharedLibVarScript('pipelineConfigSerde')
+                    if (serde) {
+                        env.CX_PIPELINE_CFG_JSON = serde.pipelineConfigToJson(cfg)
+                        echo '✅ pipelineConfigSerde: config serialized to CX_PIPELINE_CFG_JSON'
+                    }
+
+                    echo "   gitOrg=${cfg.gitOrg}, buildType=${cfg.buildType}"
+                    echo "   chainOrder=${cfg.chainOrder.join(' → ')}"
+                    echo "   effectiveSecurityTools=${effectiveSecurity}"
+                }
+            }
+        }
+
+        /**
+         * STAGE 3: Initialize & Clean
+         * CustomerXP: deletes git mirror dirs + cleanWs()
+         */
+        stage('Initialize & Clean') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════════════'
+                    echo '  Stage 3: INITIALIZE & CLEAN'
+                    echo '═══════════════════════════════════════════════════════════'
+                    def mirrorBase = env.EFFECTIVE_GIT_LOCAL_MIRROR_BASE?.trim()
+                    def orgDir     = env.EFFECTIVE_GIT_ORG_DIR?.trim()
+                    if (mirrorBase && orgDir) {
+                        def target = "${mirrorBase}/${orgDir}"
+                        echo "  Cleaning org mirror: ${target}"
+                        sh "rm -rf '${target}' 2>/dev/null || true"
+                    } else {
+                        echo '  Skipping org mirror cleanup (paths not configured)'
+                    }
+                }
+                cleanWs(deleteDirs: true, disableDeferredWipeout: true, notFailBuild: true)
+                script { echo '✅ Workspace cleaned' }
+            }
+        }
+
+        /**
+         * STAGE 4: Process Selection & Execution
+         * CustomerXP: parseModuleBranchMap → validateInstallerCorePrerequisites
+         *             → sequential chain build → parallel installer build → publishSonarReport
+         */
+        stage('Process Selection & Execution') {
+            steps {
+                script {
+                    echo '═══════════════════════════════════════════════════════════'
+                    echo '  Stage 4: PROCESS SELECTION & EXECUTION'
+                    echo '═══════════════════════════════════════════════════════════'
+
+                    def cfg = cxPipelineConfig(false)
+                    def workspaceBase = cfg.workspaceBase ?: env.CX_WORKSPACE_BASE
+
+                    // ── Resolve selected modules ──────────────────────────────
+                    def moduleSpecialCasesScript = loadSharedLibVarScript('moduleSpecialCases')
+
+                    def selectedCore = []
+                    if (params.CORE_SELECTED == 'all') {
+                        selectedCore = cfg.coreModuleIds.clone()
+                    } else if (params.CORE_SELECTED != 'none') {
+                        selectedCore = [params.CORE_SELECTED]
+                    }
+
+                    def selectedInst = []
+                    if (params.INST_SELECTED == 'all') {
+                        selectedInst = cfg.installerModuleIds.clone()
+                    } else if (params.INST_SELECTED != 'none') {
+                        selectedInst = [params.INST_SELECTED]
+                    }
+
+                    // ── Branch map (CustomerXP reads from CORE_BRANCH_CHOICES) ─
+                    def branchMap = [:]
+                    (selectedCore + selectedInst).each { modName ->
+                        branchMap[modName] = moduleSpecialCasesScript ?
+                            moduleSpecialCasesScript.getDefaultBranch(modName) : 'main'
+                    }
+
+                    // ── Validate prerequisites ────────────────────────────────
+                    def validator = loadSharedLibVarScript('validateInstallerCorePrerequisites')
+                    if (validator && selectedInst) {
+                        validator.call(
+                            installerModules: selectedInst,
+                            selectedCoreModules: selectedCore,
+                            coreModuleIds: cfg.coreModuleIds,
+                            fullOrder: env.CX_CHAIN_ORDER ?: ''
+                        )
+                    }
+
+                    echo ""
+                    echo "📋 Build Plan:"
+                    echo "   Sequential (core): ${selectedCore.join(', ') ?: '(none)'}"
+                    echo "   Parallel (installer): ${selectedInst.join(', ') ?: '(none)'}"
+                    echo "   JDK versions: ${params.jdk_version}"
+                    echo ""
+
+                    // ══════════════════════════════════════════════════════════
+                    // PHASE A: SEQUENTIAL CHAIN BUILD (core modules)
+                    // CustomerXP: executeChainBuild per module in chain order
+                    // ══════════════════════════════════════════════════════════
+                    if (selectedCore) {
+                        selectedCore.each { modName ->
+                            def branch = branchMap[modName] ?: 'main'
+                            echo "🏗️ CHAIN: ${modName} @ ${branch}"
+                            executeChainBuild(
+                                selectedModulesList: [modName],
+                                jdkVersions: params.jdk_version,
+                                cxSmgBase: workspaceBase,
+                                isCoreType: true,
+                                customBranchOverride: branch,
+                                runSecurityTools: params.RUN_SECURITY_TOOLS
+                            )
+                        }
+                    } else {
+                        echo '⏭️ No core modules selected — skipping chain build'
+                    }
+
+                    // ══════════════════════════════════════════════════════════
+                    // PHASE B: PARALLEL INSTALLER BUILD
+                    // CustomerXP: parallel { executeChainBuild per module }
+                    // ══════════════════════════════════════════════════════════
+                    if (selectedInst) {
+                        def parallelTasks = [:]
+                        selectedInst.each { modName ->
+                            def branch = branchMap[modName] ?: 'main'
+                            echo "🚀 PREPARING PARALLEL: ${modName} @ ${branch}"
+                            parallelTasks["build-${modName}"] = {
+                                stage("Build ${modName}") {
+                                    executeChainBuild(
+                                        selectedModulesList: [modName],
+                                        jdkVersions: params.jdk_version,
+                                        cxSmgBase: workspaceBase,
+                                        isCoreType: false,
+                                        customBranchOverride: branch,
+                                        runSecurityTools: params.RUN_SECURITY_TOOLS
+                                    )
+                                }
+                            }
+                        }
+                        parallel parallelTasks
+                    } else {
+                        echo '⏭️ No installer modules selected — skipping parallel build'
+                    }
+
+                    // ══════════════════════════════════════════════════════════
+                    // PHASE C: PUBLISH SONAR REPORT
+                    // CustomerXP: publishSonarReport(modules: allModulesForSonar)
+                    // ══════════════════════════════════════════════════════════
+                    def allModulesForReport = []
+                    selectedCore.each { allModulesForReport << [moduleName: it, branchName: branchMap[it] ?: 'main'] }
+                    selectedInst.each  { allModulesForReport << [moduleName: it, branchName: branchMap[it] ?: 'main'] }
+
+                    if (allModulesForReport) {
+                        publishSonarReport(
+                            modules: allModulesForReport,
+                            reportName: 'CX CI Report',
+                            failOnError: false
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            script {
+                echo ""
+                echo "═══════════════════════════════════════════════════════════"
+                echo "  PIPELINE COMPLETE — Result: ${currentBuild.result ?: 'SUCCESS'}"
+                echo "  Duration: ${currentBuild.durationString}"
+                echo "═══════════════════════════════════════════════════════════"
+            }
+        }
+        success  { echo '🎉 All modules built successfully!' }
+        failure  { echo '❌ Pipeline failed — check stage logs above' }
+        unstable { echo '⚠️ Pipeline unstable — check test/quality results' }
+    }
+}
