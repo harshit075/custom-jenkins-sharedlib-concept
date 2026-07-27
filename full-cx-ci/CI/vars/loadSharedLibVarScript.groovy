@@ -21,21 +21,22 @@
 //   def cfg = loadSharedLibVarScript('getDefaults')
 //   boolean runSecurity = cfg.getRunSecurityTools()
 
-// Scripts that MUST exist — pipeline fails if these cannot be loaded
-private static final List<String> CRITICAL_SCRIPTS = [
-    'buildModulesWithJDK',
-    'buildModulesWithJDKReleaseTag',
-    'executeChainBuild',
-    'cxPipelineConfig'
-]
-
 def call(String scriptName) {
+    // Scripts that MUST exist — pipeline fails if these cannot be loaded
+    // NOTE: Defined inside call() — Jenkins CPS does not support static fields in vars/ scripts
+    def criticalScripts = [
+        'buildModulesWithJDK',
+        'buildModulesWithJDKReleaseTag',
+        'executeChainBuild',
+        'cxPipelineConfig'
+    ]
+
     if (!scriptName?.trim()) {
         echo "⚠️ loadSharedLibVarScript: empty script name provided"
         return null
     }
 
-    boolean isCritical = CRITICAL_SCRIPTS.contains(scriptName)
+    boolean isCritical = criticalScripts.contains(scriptName)
 
     // TEST MODE: when SHARED_LIB_VARS_PATH env var is set, load from filesystem
     // This allows unit testing outside Jenkins
